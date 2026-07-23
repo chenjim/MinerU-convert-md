@@ -1,0 +1,23 @@
+services:
+  mineru-convert:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mineru-convert-md
+    ports:
+      - "56784:56784"
+    volumes:
+      - ./app:/app/app
+      - ./uploads:/app/uploads
+      - ./output:/app/output
+      - ./tests:/app/tests
+      - model_cache:/root/.cache/mineru
+    environment:
+      - MINERU_BACKEND=pipeline
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+
+volumes:
+  model_cache:

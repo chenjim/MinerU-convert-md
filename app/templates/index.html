@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MinerU 文档转换</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f5f5;
+      display: flex; justify-content: center; padding: 40px 20px;
+    }
+    .container { max-width: 640px; width: 100%; }
+    .card {
+      background: #fff; border-radius: 12px; padding: 32px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.08);
+    }
+    h1 { font-size: 22px; margin-bottom: 8px; }
+    .subtitle { color: #666; font-size: 14px; margin-bottom: 24px; }
+    .drop-zone {
+      border: 2px dashed #ccc; border-radius: 8px;
+      padding: 48px 24px; text-align: center; cursor: pointer;
+      transition: border-color .2s;
+    }
+    .drop-zone:hover, .drop-zone.dragover { border-color: #4A90D9; }
+    .drop-zone .icon { font-size: 36px; color: #999; margin-bottom: 8px; }
+    .drop-zone p { color: #666; }
+    .formats { color: #999; font-size: 13px; margin-top: 8px; }
+    #fileInput { display: none; }
+    .btn {
+      display: inline-block; margin-top: 16px;
+      background: #4A90D9; color: #fff; border: none;
+      padding: 10px 28px; border-radius: 6px; cursor: pointer;
+      font-size: 15px;
+    }
+    .btn:hover { background: #357ABD; }
+    .btn:disabled { background: #aaa; cursor: not-allowed; }
+
+    .progress-wrap {
+      margin-top: 20px; border-top: 1px solid #eee; padding-top: 16px;
+    }
+    .progress-bar {
+      width: 100%; height: 8px; background: #e0e0e0; border-radius: 4px;
+      overflow: hidden; margin-bottom: 8px;
+    }
+    .progress-fill {
+      height: 100%; width: 0%; background: linear-gradient(90deg, #4A90D9, #67B8F0);
+      border-radius: 4px; transition: width .6s ease;
+    }
+    .progress-label { font-size: 14px; color: #333; text-align: center; }
+    .progress-warn { font-size: 12px; color: #999; text-align: center; margin-top: 4px; }
+
+    .result {
+      margin-top: 20px; border-top: 1px solid #eee; padding-top: 16px;
+    }
+    .result a { color: #4A90D9; }
+    .error { color: #d33; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>MinerU 文档转换</h1>
+      <p class="subtitle">PDF / DOCX / PPTX / XLSX / 图片 → Markdown</p>
+      <p class="subtitle" style="font-size:12px;color:#999;margin-top:-16px">MinerU pipeline + PP-OCRv6 | 单文件最大 100MB</p>
+
+      <div class="drop-zone" id="dropZone">
+        <div class="icon">📄</div>
+        <p>拖拽文件到此处，或点击选择</p>
+        <p class="formats">支持: PDF, DOCX, PPTX, XLSX, PNG, JPG</p>
+      </div>
+      <input type="file" id="fileInput" accept=".pdf,.docx,.pptx,.xlsx,.png,.jpg,.jpeg">
+
+      <div style="text-align:center">
+        <button class="btn" id="convertBtn" disabled>转换</button>
+      </div>
+
+      <div class="progress-wrap" id="progressWrap" style="display:none">
+        <div class="progress-bar">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-label" id="progressLabel"></div>
+        <div class="progress-warn" id="progressWarn"></div>
+      </div>
+
+      <div class="result" id="result"></div>
+    </div>
+  </div>
+
+  <script>
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const convertBtn = document.getElementById('convertBtn');
+    const progressWrap = document.getElementById('progressWrap');
+    const progressFill = document.getElementById('progressFill');
+    const progressLabel = document.getElementById('progressLabel');
+    const progressWarn = document.getElementById('progressWarn');
+    const result = document.getElementById('result');
+    let selectedFile = null;
+
+    const STATES = [
+      { pct: 10, label: '上传中...' },
+      { pct: 45, label: 'MinerU 转换中...' },
+      { pct: 85, label: 'LLM 优化排版中...' },
+      { pct: 100, label: '✅ 转换完成' },
+    ];
+
+    function setProgress(step) {
+      const s = STATES[step];
+      progressFill.style.width = s.pct + '%';
+      progressLabel.textContent = s.label;
+      progressWarn.textContent = step < STATES.length - 1 ? '请勿刷新页面' : '';
+    }
+
+    function updateDropText(name) {
+      dropZone.querySelector('p').textContent = name;
+      dropZone.querySelector('.formats').textContent = '';
+    }
+
+    dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', e => {
+      e.preventDefault(); dropZone.classList.remove('dragover');
+      if (e.dataTransfer.files.length) {
+        selectedFile = e.dataTransfer.files[0];
+        updateDropText(selectedFile.name);
+        convertBtn.disabled = false;
+      }
+    });
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length) {
+        selectedFile = fileInput.files[0];
+        updateDropText(selectedFile.name);
+        convertBtn.disabled = false;
+      }
+    });
+
+    convertBtn.addEventListener('click', async () => {
+      if (!selectedFile) return;
+      convertBtn.disabled = true;
+      result.innerHTML = '';
+      progressWrap.style.display = 'block';
+
+      const form = new FormData();
+      form.append('file', selectedFile);
+
+      try {
+        setProgress(0);
+        const upRes = await fetch('/upload', { method: 'POST', body: form });
+        const upData = await upRes.json();
+        if (!upData.success) {
+          throw new Error(upData.detail || '上传失败');
+        }
+        const fileId = upData.file_id;
+
+        setProgress(1);
+        const cvRes = await fetch(`/convert/${fileId}`, { method: 'POST' });
+        const cvData = await cvRes.json();
+        if (!cvData.success) {
+          throw new Error(cvData.detail || '转换失败');
+        }
+
+        setProgress(2);
+        const refRes = await fetch(`/refine/${fileId}`);
+        const refData = await refRes.json();
+
+        setProgress(3);
+        const zipLink = `/download/${fileId}?zip=true`;
+        result.innerHTML = `<a href="${zipLink}">下载转换结果 (zip)</a>`
+          + (refData.optimized ? '' : '<br><span class="error" style="font-size:13px">LLM 优化不可用，仅原始结果</span>');
+      } catch (e) {
+        progressWrap.style.display = 'none';
+        result.innerHTML = `<span class="error">${e.message}</span>`;
+      } finally {
+        convertBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
