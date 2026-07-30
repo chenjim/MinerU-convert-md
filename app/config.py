@@ -11,6 +11,7 @@ MAX_FILE_SIZE = 100 * 1024 * 1024
 OUTPUT_MAX_SIZE = int(os.getenv("OUTPUT_MAX_SIZE", str(500 * 1024 * 1024)))
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".png", ".jpg", ".jpeg"}
 MINERU_BACKEND = os.getenv("MINERU_BACKEND", "pipeline")
+MINERU_METHOD = os.getenv("MINERU_METHOD", "auto")
 
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")

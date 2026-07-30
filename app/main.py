@@ -1,11 +1,13 @@
 import os
 import io
+import re
 import uuid
 import asyncio
 import tempfile
 import shutil
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Query
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
@@ -16,6 +18,174 @@ from app import config
 from app import refiner
 
 app = FastAPI(title="MinerU 文档转换服务")
+
+_pending: dict[str, asyncio.Task] = {}
+_task_status: dict[str, dict] = {}
+
+
+def _set_status(file_id: str, status: str, phase: str = "", pct: int = 0):
+    _task_status[file_id] = {"status": status, "phase": phase, "pct": pct}
+
+
+_PHASE_RANGES: list[tuple[str, str, int, int]] = [
+    ("Layout",    "布局分析",   10, 45),
+    ("MFR",       "字体识别",   45, 55),
+    ("ocr",       "文字识别",   55, 75),
+    ("OCR",       "文字识别",   55, 75),
+    ("Table",     "表格识别",   75, 82),
+    ("Formula",   "公式识别",   82, 85),
+]
+
+
+def _parse_progress(line: str) -> Optional[dict]:
+    t = line.strip()
+    if not t:
+        return None
+
+    m = re.search(r'total_pages=(\d+)', t)
+    if m:
+        return {"pages_total": int(m.group(1))}
+
+    if "model init done" in t.lower():
+        return {"phase": "模型加载完成", "pct": 10}
+
+    rpct = None
+    n, total = None, None
+
+    m = re.search(r'([A-Za-z][\w\s]+?):\s*(\d+)%.*?\|.*?\|\s*(\d+)/(\d+)\s*\[', t)
+    if m:
+        name = m.group(1).strip()
+        rpct = int(m.group(2))
+        n, total = int(m.group(3)), int(m.group(4))
+    else:
+        m = re.search(r'([A-Za-z][\w\s]+?):\s*(\d+)%', t)
+        if m:
+            name = m.group(1).strip()
+            rpct = int(m.group(2))
+        else:
+            m = re.search(r'(?:^|\s)([A-Za-z][\w\s]{2,}?)\s+(\d+)/(\d+)(?:\s|$)', t)
+            if m and not re.search(r'(?i)batch|submitting|window|doc_slices|cost|done!', m.group(1)):
+                name = m.group(1).strip()
+                n, total = int(m.group(2)), int(m.group(3))
+                rpct = int(n / total * 100)
+
+    if rpct is not None:
+        pages = f" {n}/{total} 页" if n is not None and total is not None else ""
+        for keyword, display, lo, hi in _PHASE_RANGES:
+            if keyword in name:
+                return {"phase": f"{display}{pages}", "pct": int(lo + rpct * (hi - lo) / 100)}
+        return {"phase": f"{name}{pages}", "pct": int(10 + rpct * 0.75)}
+
+    return None
+
+
+async def _refine_md(file_id: str, md_path: str):
+    md = Path(md_path)
+    text = md.read_text(encoding="utf-8")
+    md_dir = md.parent
+
+    refs = re.findall(r'!\[\]\(([^)]+)\)', text)
+    if refs:
+        total = len(refs)
+        for i, ref in enumerate(refs):
+            img_file = md_dir / ref
+            if img_file.exists():
+                desc = await asyncio.to_thread(refiner.describe_image, str(img_file))
+                if desc:
+                    text = text.replace(f"![]({ref})", f"![{desc}]({ref})", 1)
+            _set_status(file_id, "converting", f"图片理解 {i+1}/{total} 张", int(90 + (i+1)/total*5))
+
+    _set_status(file_id, "converting", "LLM 优化排版中...", 95)
+    result = await asyncio.to_thread(refiner.refine, text)
+    if result:
+        optimized = md.parent / (md.stem + "_optimized.md")
+        optimized.write_text(result, encoding="utf-8")
+
+
+async def _run_convert(file_id: str, src_path: str, out_dir: str):
+    _set_status(file_id, "converting", "模型加载...", 3)
+    try:
+        result = await _convert_with_progress(file_id, src_path, out_dir)
+        _set_status(file_id, "converting", "整理输出...", 85)
+        await asyncio.to_thread(trim_output)
+        await asyncio.to_thread(trim_uploads)
+
+        md_files = sorted(Path(out_dir).rglob("*.md"))
+        if md_files:
+            await _refine_md(file_id, str(md_files[0]))
+
+        _set_status(file_id, "done", "转换完成", 100)
+        _task_status[file_id]["result"] = result
+    except Exception as e:
+        _set_status(file_id, "error", str(e), 0)
+    finally:
+        _pending.pop(file_id, None)
+
+
+def _detect_pdf_method(path: str) -> str:
+    """Detect if PDF is text-based (txt) or scanned (ocr)."""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        total = 0
+        for page in reader.pages[:5]:
+            total += len((page.extract_text() or "").strip())
+        return "txt" if total > 100 else "ocr"
+    except Exception:
+        return "auto"
+
+
+async def _convert_with_progress(file_id: str, src_path: str, out_dir: str) -> dict:
+    method = config.MINERU_METHOD
+    if method == "auto" and src_path.lower().endswith(".pdf"):
+        method = _detect_pdf_method(src_path)
+
+    cmd = [
+        "mineru", "-p", src_path, "-o", out_dir,
+        "--backend", config.MINERU_BACKEND,
+        "-m", method,
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stderr_lines: list[str] = []
+
+    async def _read_stderr():
+        while True:
+            chunk = await process.stderr.read(4096)
+            if not chunk:
+                break
+            text = chunk.decode(errors="replace")
+            stderr_lines.append(text)
+            for seg in re.split(r"[\r\n]+", text):
+                seg = seg.strip()
+                if not seg:
+                    continue
+                p = _parse_progress(seg)
+                if p:
+                    cur = _task_status.get(file_id, {})
+                    if p.get("pct", 0) < cur.get("pct", 0):
+                        p["pct"] = cur["pct"]
+                    _task_status[file_id].update(p)
+
+    reader = asyncio.create_task(_read_stderr())
+    returncode = await process.wait()
+    await reader
+    error_text = "".join(stderr_lines).strip()
+
+    if returncode != 0:
+        raise RuntimeError(f"mineru 失败: {error_text or 'unknown error'}")
+
+    files = sorted(
+        str(f.relative_to(out_dir))
+        for f in Path(out_dir).rglob("*")
+        if f.is_file()
+    )
+    return {"files": files}
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,6 +264,9 @@ async def convert(file_id: str):
     if not save_dir.exists():
         raise HTTPException(status_code=404, detail="文件不存在，请先上传")
 
+    if _task_status.get(file_id, {}).get("status") in ("pending", "converting"):
+        raise HTTPException(status_code=409, detail="转换正在进行中")
+
     files = list(save_dir.iterdir())
     if not files:
         raise HTTPException(status_code=404, detail="上传文件不存在")
@@ -102,36 +275,19 @@ async def convert(file_id: str):
     out_dir = config.OUTPUT_DIR / file_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        result = await convert_file(src_path, str(out_dir))
-        await asyncio.to_thread(trim_output)
-        await asyncio.to_thread(trim_uploads)
-        return {"success": True, "file_id": file_id, "output": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"转换失败: {str(e)}")
+    _set_status(file_id, "pending", "排队中", 0)
+    task = asyncio.create_task(_run_convert(file_id, src_path, str(out_dir)))
+    _pending[file_id] = task
 
-async def convert_file(src_path: str, out_dir: str) -> dict:
-    cmd = [
-        "mineru", "-p", src_path, "-o", out_dir,
-        "--backend", config.MINERU_BACKEND,
-    ]
+    return {"success": True, "file_id": file_id}
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
 
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        raise RuntimeError(f"mineru 失败: {stderr.decode().strip() or 'unknown error'}")
-
-    files = sorted(
-        str(f.relative_to(out_dir))
-        for f in Path(out_dir).rglob("*")
-        if f.is_file()
-    )
-    return {"files": files}
+@app.get("/status/{file_id}")
+async def get_status(file_id: str):
+    status = _task_status.get(file_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"file_id": file_id, **status}
 
 @app.get("/refine/{file_id}")
 async def refine(file_id: str):

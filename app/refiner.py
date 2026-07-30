@@ -1,7 +1,12 @@
+import base64
+import re
+from pathlib import Path
 from openai import OpenAI
 from app import config
 
-PROMPT = """你是一名文档排版专家。请对以下由 OCR/文档转换生成的 Markdown 文本进行全面优化：
+DESCRIBE_PROMPT = "请简要描述这张图片的内容，包括图中的文字。50字以内，只返回描述，不要额外说明。"
+
+REFINE_PROMPT = """你是一名文档排版专家。请对以下由 OCR/文档转换生成的 Markdown 文本进行全面优化：
 
 一、OCR 纠错
 - 修正中英文混排、数字、标点符号、多余/缺失空格
@@ -23,7 +28,7 @@ PROMPT = """你是一名文档排版专家。请对以下由 OCR/文档转换生
 
 四、约束
 - 保留所有原始信息，不凭空补充原文没有的内容
-- 保留原文图片引用不变
+- 保留原文图片引用不变（包括已添加的图片描述）
 - 只输出修正后的 Markdown，不要额外说明"""
 
 
@@ -33,21 +38,69 @@ def get_client() -> OpenAI | None:
     return OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
 
 
+def describe_image(image_path: str) -> str | None:
+    client = get_client()
+    if client is None:
+        return None
+
+    ext = Path(image_path).suffix.lower()
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(ext, "image/jpeg")
+
+    try:
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+    except Exception:
+        return None
+
+    try:
+        resp = client.chat.completions.create(
+            model=config.LLM_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": DESCRIBE_PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ],
+            }],
+            temperature=0.1,
+            max_tokens=256,
+        )
+        return resp.choices[0].message.content.strip() or None
+    except Exception:
+        return None
+
+
+def add_image_alt_text(md_text: str, md_dir: str) -> str:
+    def _repl(m: re.Match) -> str:
+        alt = m.group(1) or ""
+        path = m.group(2)
+        if alt:
+            return m.group(0)
+        full = str(Path(md_dir) / path)
+        if Path(full).exists():
+            desc = describe_image(full)
+            if desc:
+                alt = desc
+        return f"![{alt}]({path})"
+
+    return re.sub(r'!\[(.*?)\]\((.+?)\)', _repl, md_text)
+
+
 def refine(markdown_text: str) -> str | None:
     client = get_client()
     if client is None:
         return None
 
     try:
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=config.LLM_MODEL,
             messages=[
-                {"role": "system", "content": PROMPT},
+                {"role": "system", "content": REFINE_PROMPT},
                 {"role": "user", "content": markdown_text},
             ],
             temperature=0.1,
             max_tokens=8192,
         )
-        return response.choices[0].message.content or None
+        return resp.choices[0].message.content or None
     except Exception:
         return None

@@ -61,7 +61,7 @@
 <body>
   <div class="container">
     <div class="card">
-      <h1>MinerU 文档转换</h1>
+      <h1><a href="https://h89.cn/archives/664.html" target="_blank" style="text-decoration:none;color:inherit">MinerU 文档转换</a></h1>
       <p class="subtitle">PDF / DOCX / PPTX / XLSX / 图片 → Markdown</p>
       <p class="subtitle" style="font-size:12px;color:#999;margin-top:-16px">MinerU pipeline + PP-OCRv6 | 单文件最大 100MB</p>
 
@@ -99,18 +99,10 @@
     const result = document.getElementById('result');
     let selectedFile = null;
 
-    const STATES = [
-      { pct: 10, label: '上传中...' },
-      { pct: 45, label: 'MinerU 转换中...' },
-      { pct: 85, label: 'LLM 优化排版中...' },
-      { pct: 100, label: '✅ 转换完成' },
-    ];
-
-    function setProgress(step) {
-      const s = STATES[step];
-      progressFill.style.width = s.pct + '%';
-      progressLabel.textContent = s.label;
-      progressWarn.textContent = step < STATES.length - 1 ? '请勿刷新页面' : '';
+    function setProgress(pct, phase) {
+      progressFill.style.width = Math.min(pct, 100) + '%';
+      progressLabel.textContent = phase;
+      progressWarn.textContent = pct > 0 && pct < 100 ? '请勿刷新页面' : '';
     }
 
     function updateDropText(name) {
@@ -147,7 +139,7 @@
       form.append('file', selectedFile);
 
       try {
-        setProgress(0);
+        setProgress(5, '上传中...');
         const upRes = await fetch('/upload', { method: 'POST', body: form });
         const upData = await upRes.json();
         if (!upData.success) {
@@ -155,21 +147,24 @@
         }
         const fileId = upData.file_id;
 
-        setProgress(1);
+        setProgress(10, '排队中...');
         const cvRes = await fetch(`/convert/${fileId}`, { method: 'POST' });
-        const cvData = await cvRes.json();
-        if (!cvData.success) {
-          throw new Error(cvData.detail || '转换失败');
+        if (!cvRes.ok) {
+          const err = await cvRes.json().catch(() => ({}));
+          throw new Error(err.detail || '转换启动失败');
         }
 
-        setProgress(2);
-        const refRes = await fetch(`/refine/${fileId}`);
-        const refData = await refRes.json();
-
-        setProgress(3);
+        while (true) {
+          const stRes = await fetch(`/status/${fileId}`);
+          const stData = await stRes.json();
+          if (stData.status === 'done') break;
+          if (stData.status === 'error') throw new Error(stData.error || '转换失败');
+          setProgress(stData.pct, stData.phase || '转换中...');
+          await new Promise(r => setTimeout(r, 2000));
+        }
+        setProgress(100, '✅ 转换完成');
         const zipLink = `/download/${fileId}?zip=true`;
-        result.innerHTML = `<a href="${zipLink}">下载转换结果 (zip)</a>`
-          + (refData.optimized ? '' : '<br><span class="error" style="font-size:13px">LLM 优化不可用，仅原始结果</span>');
+        result.innerHTML = `<a href="${zipLink}">下载转换结果 (zip)</a>`;
       } catch (e) {
         progressWrap.style.display = 'none';
         result.innerHTML = `<span class="error">${e.message}</span>`;
