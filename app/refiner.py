@@ -1,5 +1,7 @@
 import base64
 import re
+import sys
+import time
 from pathlib import Path
 from openai import OpenAI
 from app import config
@@ -38,7 +40,8 @@ def get_client() -> OpenAI | None:
     return OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
 
 
-def describe_image(image_path: str) -> str | None:
+def describe_image(image_path: str, retries: int = 3, timeout: float = 60) -> str | None:
+    """生成图片 alt 描述。视觉接口偶发失败，自动重试 retries 次。"""
     client = get_client()
     if client is None:
         return None
@@ -52,22 +55,30 @@ def describe_image(image_path: str) -> str | None:
     except Exception:
         return None
 
-    try:
-        resp = client.chat.completions.create(
-            model=config.LLM_MODEL,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": DESCRIBE_PROMPT},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                ],
-            }],
-            temperature=0.1,
-            max_tokens=256,
-        )
-        return resp.choices[0].message.content.strip() or None
-    except Exception:
-        return None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=config.LLM_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": DESCRIBE_PROMPT},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                    ],
+                }],
+                temperature=0.1,
+                max_tokens=256,
+                timeout=timeout,
+            )
+            content = resp.choices[0].message.content
+            if content and content.strip():
+                return content.strip()
+            raise ValueError("empty response")
+        except Exception as e:
+            print(f"[describe_image] attempt {attempt}/{retries} failed: {e}", file=sys.stderr, flush=True)
+            if attempt < retries:
+                time.sleep(2 * attempt)
+    return None
 
 
 def add_image_alt_text(md_text: str, md_dir: str) -> str:

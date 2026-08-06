@@ -218,6 +218,10 @@ def trim_uploads():
         if d.is_dir() and d.name not in ids_in_use:
             shutil.rmtree(d, ignore_errors=True)
 
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "mineru-convert-md"}
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = Path(__file__).parent / "templates" / "index.html"
@@ -344,8 +348,9 @@ async def download(file_id: str, filename: str = "", zip: bool = Query(False)):
 
     md_files = sorted(file_dir.rglob("*.md"))
     if md_files:
-        name = md_files[0].name
-        return FileResponse(str(md_files[0]), filename=name)
+        optimized = next((f for f in md_files if f.name.endswith("_optimized.md")), None)
+        chosen = optimized or md_files[0]
+        return FileResponse(str(chosen), filename=chosen.name)
 
     raise HTTPException(status_code=404, detail="未找到输出文件")
 

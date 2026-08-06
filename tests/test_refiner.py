@@ -1,6 +1,14 @@
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from app import refiner
+
+
+def _make_response(content):
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = content
+    return mock_response
 
 
 def test_get_client_returns_none_without_key():
@@ -54,6 +62,61 @@ def test_refine_returns_none_on_empty_content():
 
 
 def test_prompt_contains_key_instructions():
-    assert "OCR" in refiner.PROMPT
-    assert "Markdown" in refiner.PROMPT
-    assert "嵌套列表" in refiner.PROMPT
+    assert "OCR" in refiner.REFINE_PROMPT
+    assert "Markdown" in refiner.REFINE_PROMPT
+    assert "嵌套列表" in refiner.REFINE_PROMPT
+
+
+def test_describe_image_returns_none_without_key(tmp_path):
+    img = tmp_path / "a.png"
+    img.write_bytes(b"fake")
+    with patch("app.config.LLM_API_KEY", ""):
+        assert refiner.describe_image(str(img)) is None
+
+
+def test_describe_image_retries_then_success(tmp_path):
+    img = tmp_path / "a.png"
+    img.write_bytes(b"fake")
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = [
+        Exception("timeout"),
+        Exception("timeout"),
+        _make_response("  一张架构图  "),
+    ]
+
+    with patch("app.config.LLM_API_KEY", "sk-test"):
+        with patch("app.refiner.get_client", return_value=mock_client):
+            with patch("app.refiner.time.sleep"):
+                assert refiner.describe_image(str(img)) == "一张架构图"
+    assert mock_client.chat.completions.create.call_count == 3
+    assert mock_client.chat.completions.create.call_args.kwargs["timeout"] == 60
+
+
+def test_describe_image_retries_on_empty_content(tmp_path):
+    img = tmp_path / "a.png"
+    img.write_bytes(b"fake")
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = [
+        _make_response(None),
+        _make_response(""),
+        _make_response("内容"),
+    ]
+
+    with patch("app.config.LLM_API_KEY", "sk-test"):
+        with patch("app.refiner.get_client", return_value=mock_client):
+            with patch("app.refiner.time.sleep"):
+                assert refiner.describe_image(str(img)) == "内容"
+    assert mock_client.chat.completions.create.call_count == 3
+
+
+def test_describe_image_returns_none_on_all_failures(tmp_path):
+    img = tmp_path / "a.png"
+    img.write_bytes(b"fake")
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = Exception("API error")
+
+    with patch("app.config.LLM_API_KEY", "sk-test"):
+        with patch("app.refiner.get_client", return_value=mock_client):
+            with patch("app.refiner.time.sleep"):
+                assert refiner.describe_image(str(img)) is None
+    assert mock_client.chat.completions.create.call_count == 3

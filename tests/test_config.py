@@ -5,7 +5,7 @@ from app import config
 def test_default_values():
     assert config.MAX_FILE_SIZE == 100 * 1024 * 1024
     assert config.MINERU_BACKEND == "pipeline"
-    assert config.LLM_BASE_URL == "https://api.deepseek.com"
+    assert config.LLM_BASE_URL == os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
     assert ".pdf" in config.ALLOWED_EXTENSIONS
     assert ".docx" in config.ALLOWED_EXTENSIONS
 
