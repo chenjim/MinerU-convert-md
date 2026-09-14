@@ -85,6 +85,10 @@ FastAPI (app/main.py)
 - 无表格阶段时，OCR 起点前移（让出表格区间），避免空档跳变。
 - 图片 alt 阶段：85→93；LLM 重排：95；完成 100。
 
+### 5.7 前端界面
+- 单页应用，拖拽/选择文件 → 上传 → 转换 → 轮询进度 → 下载 zip。
+- 深色模式：默认跟随系统（`prefers-color-scheme`），右上角按钮可手动切换，选择存入 `localStorage`；首屏用内联脚本预设主题，避免闪白。
+
 ## 6. 接口契约
 
 | 方法 | 路径 | 参数 | 返回 |
@@ -152,5 +156,6 @@ docker exec mineru-convert-md python3 -m pytest tests/ -v
 - 图片 alt 识图改为最多 5 路并发 + 同图去重。
 - 文本 LLM 与视觉模型拆分为两套配置（`LLM_*` / `VLM_*`）；识图切本地 ollama `qwen3.5:2b`。
 - 新增前端「补充图片描述（alt）」开关（默认关），与「大模型优化排版」解耦；`/convert` 增加 `alt` 参数。
+- 前端新增深色模式：跟随系统 + 手动切换，`localStorage` 记忆。
 - 识图输出上限 200 字，`max_tokens` 10240，单请求超时 60s，关闭 SDK 内部重试。
 - PDF `auto` 方法透传 MinerU 分类器（移除应用内 pypdf 启发式）。
