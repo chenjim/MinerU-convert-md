@@ -1,11 +1,13 @@
 import os
 import io
 import re
+import sys
 import uuid
 import asyncio
 import tempfile
 import shutil
 import zipfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -16,8 +18,21 @@ import uvicorn
 
 from app import config
 from app import refiner
+from app import mineru_pool
 
-app = FastAPI(title="MinerU 文档转换服务")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if config.MINERU_WARM_POOL:
+        try:
+            await mineru_pool.start_pool()
+        except Exception as e:
+            print(f"[warn] mineru 常驻池启动失败，回退冷启动: {e}", file=sys.stderr, flush=True)
+    yield
+    await mineru_pool.stop_pool()
+
+
+app = FastAPI(title="MinerU 文档转换服务", lifespan=lifespan)
 
 _pending: dict[str, asyncio.Task] = {}
 _task_status: dict[str, dict] = {}
@@ -27,92 +42,162 @@ def _set_status(file_id: str, status: str, phase: str = "", pct: int = 0):
     _task_status[file_id] = {"status": status, "phase": phase, "pct": pct}
 
 
-_PHASE_RANGES: list[tuple[str, str, int, int]] = [
-    ("Layout",    "布局分析",   10, 45),
-    ("MFR",       "字体识别",   45, 55),
-    ("ocr",       "文字识别",   55, 75),
-    ("OCR",       "文字识别",   55, 75),
-    ("Table",     "表格识别",   75, 82),
-    ("Formula",   "公式识别",   82, 85),
+_RUN_INFO_RE = re.compile(r'total_pages=(\d+).*?total_batches=(\d+)')
+_BATCH_RE = re.compile(r'window batch (\d+)/(\d+)', re.I)
+_PAGE_BAR_RE = re.compile(r'Processing pages:\s*(\d+)%.*?\|\s*(\d+)/(\d+)')
+_STAGE_BAR_RE = re.compile(r'([A-Za-z][\w\s-]+?):\s*(\d+)%.*?\|\s*(\d+)/(\d+)')
+
+# pipeline 后端实际执行顺序：Layout → Table → OCR(det→rec)，每个 batch 内独立重置。
+# Layout 计数是页数，Table/OCR 计数是检测框（区域）数，单位不同需分别标注。
+# 批内区间按各阶段实测耗时占比分配（OCR 检测最耗时），避免早期阶段跑太快、OCR 段卡住。
+# (进度条关键字, 显示名, 计数单位, 批内起始比例, 批内结束比例)
+_TABLE_BAND = 0.12
+_STAGE_BANDS: list[tuple[str, str, str, float, float]] = [
+    ("layout",  "布局分析", "页",   0.00, 0.20),
+    ("table",   "表格识别", "区域", 0.20, 0.20 + _TABLE_BAND),
+    ("ocr-det", "文字识别", "区域", 0.20 + _TABLE_BAND, 0.85),
+    ("ocr-rec", "文字识别", "区域", 0.85, 1.00),
 ]
 
 
-def _parse_progress(line: str) -> Optional[dict]:
-    t = line.strip()
-    if not t:
+class _ProgressTracker:
+    """把 MinerU 的 tqdm 进度条映射成平滑单调的全局百分比（10→85）。
+
+    整体进度 = 已完成页数占比 + 当前 batch 内阶段进度 / batch 总数。
+    Processing pages 提供跨 batch 的页进度，Layout/Table/OCR 提供批内细粒度进度；
+    阶段文案直接采用进度条自身的计数（页 / 区域），不做页码估算。
+    """
+
+    def __init__(self, upper: int = 85) -> None:
+        self.upper = upper
+        self.total_pages = 1
+        self.total_batches = 1
+        self.pages_done = 0
+        self.stage = 0.0
+        self.table_seen = False
+        self.active = False
+        self.pct = 0
+
+    def _overall(self) -> int:
+        pages = min(1.0, self.pages_done / self.total_pages)
+        overall = min(1.0, pages + self.stage / self.total_batches)
+        return int(10 + overall * (self.upper - 10))
+
+    def _emit(self, phase: str) -> dict:
+        self.pct = max(self.pct, self._overall())
+        return {"phase": phase, "pct": self.pct}
+
+    def feed(self, line: str) -> Optional[dict]:
+        t = line.strip()
+        if not t:
+            return None
+
+        m = _RUN_INFO_RE.search(t)
+        if m:
+            self.total_pages = max(1, int(m.group(1)))
+            self.total_batches = max(1, int(m.group(2)))
+            self.active = True
+            return None
+
+        # 未见到本次任务的起始行前，忽略残留的进度行（常驻 worker 复用时的串扰）
+        if not self.active:
+            return None
+
+        if _BATCH_RE.search(t):
+            self.stage = 0.0
+            self.table_seen = False
+            return None
+
+        if "model init done" in t.lower():
+            self.pct = max(self.pct, 10)
+            return {"phase": "模型加载完成", "pct": self.pct}
+
+        m = _PAGE_BAR_RE.search(t)
+        if m:
+            self.pages_done = max(self.pages_done, int(m.group(2)))
+            self.total_pages = max(self.total_pages, int(m.group(3)))
+            self.stage = 0.0
+            return self._emit(f"处理页面 {self.pages_done}/{self.total_pages} 页")
+
+        m = _STAGE_BAR_RE.search(t)
+        if m:
+            name, rpct = m.group(1).lower(), int(m.group(2))
+            n, total = int(m.group(3)), int(m.group(4))
+            for keyword, display, unit, lo, hi in _STAGE_BANDS:
+                if keyword in name:
+                    if keyword == "table":
+                        self.table_seen = True
+                    elif not self.table_seen and keyword.startswith("ocr"):
+                        # 本批没有表格阶段：OCR 起点前移，表格区间让给 OCR，避免空档跳变
+                        lo = max(0.0, lo - _TABLE_BAND)
+                    self.stage = max(self.stage, lo + (hi - lo) * rpct / 100)
+                    return self._emit(f"{display} {n}/{total} {unit}")
+            return None
+
         return None
 
-    m = re.search(r'total_pages=(\d+)', t)
-    if m:
-        return {"pages_total": int(m.group(1))}
 
-    if "model init done" in t.lower():
-        return {"phase": "模型加载完成", "pct": 10}
-
-    rpct = None
-    n, total = None, None
-
-    m = re.search(r'([A-Za-z][\w\s]+?):\s*(\d+)%.*?\|.*?\|\s*(\d+)/(\d+)\s*\[', t)
-    if m:
-        name = m.group(1).strip()
-        rpct = int(m.group(2))
-        n, total = int(m.group(3)), int(m.group(4))
-    else:
-        m = re.search(r'([A-Za-z][\w\s]+?):\s*(\d+)%', t)
-        if m:
-            name = m.group(1).strip()
-            rpct = int(m.group(2))
-        else:
-            m = re.search(r'(?:^|\s)([A-Za-z][\w\s]{2,}?)\s+(\d+)/(\d+)(?:\s|$)', t)
-            if m and not re.search(r'(?i)batch|submitting|window|doc_slices|cost|done!', m.group(1)):
-                name = m.group(1).strip()
-                n, total = int(m.group(2)), int(m.group(3))
-                rpct = int(n / total * 100)
-
-    if rpct is not None:
-        pages = f" {n}/{total} 页" if n is not None and total is not None else ""
-        for keyword, display, lo, hi in _PHASE_RANGES:
-            if keyword in name:
-                return {"phase": f"{display}{pages}", "pct": int(lo + rpct * (hi - lo) / 100)}
-        return {"phase": f"{name}{pages}", "pct": int(10 + rpct * 0.75)}
-
-    return None
-
-
-async def _refine_md(file_id: str, md_path: str):
+async def _refine_md(file_id: str, md_path: str, add_alt: bool = True, do_refine: bool = True):
+    """按开关补图片 alt（最多 VLM_MAX_CONCURRENCY 路并发）与 LLM 重排，结果存为 *_optimized.md。"""
     md = Path(md_path)
-    text = md.read_text(encoding="utf-8")
+    original = text = md.read_text(encoding="utf-8")
     md_dir = md.parent
 
-    refs = re.findall(r'!\[\]\(([^)]+)\)', text)
-    if refs:
-        total = len(refs)
-        for i, ref in enumerate(refs):
-            img_file = md_dir / ref
-            if img_file.exists():
-                desc = await asyncio.to_thread(refiner.describe_image, str(img_file))
-                if desc:
-                    text = text.replace(f"![]({ref})", f"![{desc}]({ref})", 1)
-            _set_status(file_id, "converting", f"图片理解 {i+1}/{total} 张", int(90 + (i+1)/total*5))
+    if add_alt:
+        # 去重：同一图片只识别一次
+        refs = list(dict.fromkeys(re.findall(r'!\[\]\(([^)]+)\)', text)))
+        if refs:
+            total = len(refs)
+            sem = asyncio.Semaphore(config.VLM_MAX_CONCURRENCY)
+            lock = asyncio.Lock()
+            descs: dict[str, str] = {}
+            done = 0
 
-    _set_status(file_id, "converting", "LLM 优化排版中...", 95)
-    result = await asyncio.to_thread(refiner.refine, text)
-    if result:
-        optimized = md.parent / (md.stem + "_optimized.md")
-        optimized.write_text(result, encoding="utf-8")
+            async def _one(ref: str) -> None:
+                nonlocal done
+                img_file = md_dir / ref
+                desc = None
+                if img_file.exists():
+                    async with sem:
+                        desc = await asyncio.to_thread(refiner.describe_image, str(img_file))
+                async with lock:
+                    if desc:
+                        descs[ref] = desc
+                    done += 1
+                    _set_status(file_id, "converting", f"图片理解 {done}/{total} 张", int(85 + done / total * 8))
+
+            await asyncio.gather(*(_one(ref) for ref in refs))
+            # gather 期间只读文本，收集完再统一替换，避免并发改写
+            for ref, desc in descs.items():
+                text = text.replace(f"![]({ref})", f"![{desc}]({ref})")
+
+    optimized = md.parent / (md.stem + "_optimized.md")
+    if do_refine:
+        _set_status(file_id, "converting", "LLM 优化排版中...", 95)
+        result = await asyncio.to_thread(refiner.refine, text)
+        if result:
+            optimized.write_text(result, encoding="utf-8")
+            return
+    # 未做 LLM 重排（或重排失败）时，落盘补好 alt 的文本，避免描述丢失
+    if text != original:
+        optimized.write_text(text, encoding="utf-8")
 
 
-async def _run_convert(file_id: str, src_path: str, out_dir: str):
-    _set_status(file_id, "converting", "模型加载...", 3)
+async def _run_convert(file_id: str, src_path: str, out_dir: str, optimize: bool = False, alt: bool = False):
+    _set_status(file_id, "converting", "排队中...", 5)
+    # 有后处理（图片 alt / LLM 重排）时 MinerU 保留 10~85；否则独占 10~95
+    post = optimize or alt
+    upper = 85 if post else 95
     try:
-        result = await _convert_with_progress(file_id, src_path, out_dir)
-        _set_status(file_id, "converting", "整理输出...", 85)
+        result = await _convert_with_progress(file_id, src_path, out_dir, upper=upper)
+        _set_status(file_id, "converting", "整理输出...", upper)
         await asyncio.to_thread(trim_output)
         await asyncio.to_thread(trim_uploads)
 
-        md_files = sorted(Path(out_dir).rglob("*.md"))
-        if md_files:
-            await _refine_md(file_id, str(md_files[0]))
+        if post:
+            md_files = sorted(Path(out_dir).rglob("*.md"))
+            if md_files:
+                await _refine_md(file_id, str(md_files[0]), add_alt=alt, do_refine=optimize)
 
         _set_status(file_id, "done", "转换完成", 100)
         _task_status[file_id]["result"] = result
@@ -122,36 +207,20 @@ async def _run_convert(file_id: str, src_path: str, out_dir: str):
         _pending.pop(file_id, None)
 
 
-def _detect_pdf_method(path: str) -> str:
-    """Detect if PDF is text-based (txt) or scanned (ocr)."""
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(path)
-        total = 0
-        for page in reader.pages[:5]:
-            total += len((page.extract_text() or "").strip())
-        return "txt" if total > 100 else "ocr"
-    except Exception:
-        return "auto"
+def _merge_progress(file_id: str, p: dict) -> None:
+    cur = _task_status.setdefault(file_id, {})
+    if p.get("pct", 0) < cur.get("pct", 0):
+        p["pct"] = cur["pct"]
+    cur.update(p)
 
 
-async def _convert_with_progress(file_id: str, src_path: str, out_dir: str) -> dict:
-    method = config.MINERU_METHOD
-    if method == "auto" and src_path.lower().endswith(".pdf"):
-        method = _detect_pdf_method(src_path)
-
-    cmd = [
-        "mineru", "-p", src_path, "-o", out_dir,
-        "--backend", config.MINERU_BACKEND,
-        "-m", method,
-    ]
-
+async def _run_mineru(cmd: list[str], log_file, on_line=None) -> tuple[int, str]:
+    """启动 mineru 子进程，落盘 stderr，并按需回调每一行。"""
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-
     stderr_lines: list[str] = []
 
     async def _read_stderr():
@@ -160,22 +229,56 @@ async def _convert_with_progress(file_id: str, src_path: str, out_dir: str) -> d
             if not chunk:
                 break
             text = chunk.decode(errors="replace")
+            log_file.write(text)
+            log_file.flush()
             stderr_lines.append(text)
-            for seg in re.split(r"[\r\n]+", text):
-                seg = seg.strip()
-                if not seg:
-                    continue
-                p = _parse_progress(seg)
-                if p:
-                    cur = _task_status.get(file_id, {})
-                    if p.get("pct", 0) < cur.get("pct", 0):
-                        p["pct"] = cur["pct"]
-                    _task_status[file_id].update(p)
+            if on_line is not None:
+                for seg in re.split(r"[\r\n]+", text):
+                    on_line(seg)
 
     reader = asyncio.create_task(_read_stderr())
     returncode = await process.wait()
     await reader
-    error_text = "".join(stderr_lines).strip()
+    return returncode, "".join(stderr_lines).strip()
+
+
+async def _convert_with_progress(file_id: str, src_path: str, out_dir: str, upper: int = 85) -> dict:
+    # auto 直接透传给 MinerU，由其 pdfium 分类器判断 txt/ocr（可识别乱码字体/扫描件）
+    method = config.MINERU_METHOD
+
+    base_cmd = [
+        "mineru", "-p", src_path, "-o", out_dir,
+        "--backend", config.MINERU_BACKEND,
+        "-m", method,
+    ]
+
+    log_path = Path(out_dir) / "convert.log"
+    log_file = open(log_path, "w", encoding="utf-8")
+
+    tracker = _ProgressTracker(upper=upper)
+    pool = mineru_pool.get_pool()
+    worker = None
+    try:
+        if pool is not None:
+            worker = await pool.acquire()
+            _set_status(file_id, "converting", "模型加载...", 8)
+            worker.bind(tracker, lambda p: _merge_progress(file_id, p), log_file)
+            cmd = base_cmd + ["--api-url", worker.url]
+            log_file.write(f"# cmd: {' '.join(cmd)} (warm worker :{worker.port})\n")
+            log_file.flush()
+            returncode, error_text = await _run_mineru(cmd, log_file)
+        else:
+            _set_status(file_id, "converting", "模型加载...", 8)
+            log_file.write(f"# cmd: {' '.join(base_cmd)}\n")
+            log_file.flush()
+            returncode, error_text = await _run_mineru(
+                base_cmd, log_file, on_line=lambda seg: _feed_line(file_id, tracker, seg)
+            )
+    finally:
+        if worker is not None:
+            worker.unbind()
+            pool.release(worker)
+        log_file.close()
 
     if returncode != 0:
         raise RuntimeError(f"mineru 失败: {error_text or 'unknown error'}")
@@ -183,9 +286,15 @@ async def _convert_with_progress(file_id: str, src_path: str, out_dir: str) -> d
     files = sorted(
         str(f.relative_to(out_dir))
         for f in Path(out_dir).rglob("*")
-        if f.is_file()
+        if f.is_file() and f.name != "convert.log"
     )
     return {"files": files}
+
+
+def _feed_line(file_id: str, tracker: "_ProgressTracker", seg: str) -> None:
+    p = tracker.feed(seg)
+    if p:
+        _merge_progress(file_id, p)
 
 app.add_middleware(
     CORSMiddleware,
@@ -263,7 +372,7 @@ async def upload_file(file: UploadFile = File(...)):
     return {"success": True, "file_id": file_id, "filename": file.filename, "size": total}
 
 @app.post("/convert/{file_id}")
-async def convert(file_id: str):
+async def convert(file_id: str, optimize: bool = Query(False), alt: bool = Query(False)):
     save_dir = config.UPLOAD_DIR / file_id
     if not save_dir.exists():
         raise HTTPException(status_code=404, detail="文件不存在，请先上传")
@@ -280,7 +389,7 @@ async def convert(file_id: str):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     _set_status(file_id, "pending", "排队中", 0)
-    task = asyncio.create_task(_run_convert(file_id, src_path, str(out_dir)))
+    task = asyncio.create_task(_run_convert(file_id, src_path, str(out_dir), optimize, alt))
     _pending[file_id] = task
 
     return {"success": True, "file_id": file_id}
@@ -327,7 +436,7 @@ async def download(file_id: str, filename: str = "", zip: bool = Query(False)):
             raise HTTPException(status_code=404, detail="未找到输出文件")
         root = md_files[0].parent
         buf = io.BytesIO()
-        skip_suffixes = {".json", ".pdf"}
+        skip_suffixes = {".json", ".pdf", ".log"}
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for f in sorted(root.rglob("*")):
                 if f.is_file() and f.suffix.lower() not in skip_suffixes:

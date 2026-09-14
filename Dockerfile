@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uv
 
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pytorch/whl/cpu torch torchvision
 
-RUN uv pip install --system --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple "mineru[pipeline]" six pytest pytest-asyncio
+RUN uv pip install --system --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple "mineru[pipeline]==3.4.5" six pytest pytest-asyncio
 
 COPY app/ ./app/
 

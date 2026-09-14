@@ -1,6 +1,6 @@
 import json, io, zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock, MagicMock
 
 import pytest
 
@@ -103,3 +103,187 @@ def test_refine_returns_not_optimized_when_no_key(client, tmp_path):
             assert resp.status_code == 200
             body = resp.json()
             assert body["optimized"] is False
+
+
+def test_download_zip_excludes_log(client, tmp_path):
+    from app import config
+    file_id = "zip_log"
+    content_dir = tmp_path / "output" / file_id / "stem" / "auto"
+    content_dir.mkdir(parents=True)
+    (content_dir / "stem.md").write_text("# Original", encoding="utf-8")
+    (content_dir / "convert.log").write_text("raw stderr", encoding="utf-8")
+
+    with patch("app.config.OUTPUT_DIR", tmp_path / "output"):
+        resp = client.get(f"/download/{file_id}?zip=true")
+        assert resp.status_code == 200
+        names = zipfile.ZipFile(io.BytesIO(resp.content)).namelist()
+        assert "stem.md" in names
+        assert "convert.log" not in names
+
+
+def test_convert_writes_stderr_log(tmp_path):
+    import asyncio
+    from app import main
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    chunks = [b"model init done\nLayout Predict:  50%|#####| 1/2 [00:00<00:00]\n", b""]
+
+    async def fake_read(_n):
+        return chunks.pop(0)
+
+    process = MagicMock()
+    process.stderr.read = AsyncMock(side_effect=fake_read)
+    process.wait = AsyncMock(return_value=0)
+
+    with patch("app.main.asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock:
+        mock.return_value = process
+        result = asyncio.run(
+            main._convert_with_progress("log_test", str(tmp_path / "a.pdf"), str(out_dir))
+        )
+
+    assert result == {"files": []}
+    log = (out_dir / "convert.log").read_text(encoding="utf-8")
+    assert "model init done" in log
+    assert "Layout Predict" in log
+
+
+def test_run_convert_skips_postprocess_when_disabled(tmp_path):
+    import asyncio
+    from app import main
+    called = {"refine": False}
+
+    async def fake_convert(file_id, src_path, out_dir, upper=85):
+        return {"files": []}
+
+    async def fake_refine(file_id, md_path, **kwargs):
+        called["refine"] = True
+
+    with patch("app.main._convert_with_progress", new=fake_convert):
+        with patch("app.main._refine_md", new=fake_refine):
+            with patch("app.main.trim_output"), patch("app.main.trim_uploads"):
+                asyncio.run(main._run_convert("t_default", "x.pdf", str(tmp_path), optimize=False, alt=False))
+
+    assert called["refine"] is False
+    assert main._task_status["t_default"]["status"] == "done"
+
+
+def test_run_convert_runs_alt_only_without_optimize(tmp_path):
+    import asyncio
+    from app import main
+    out_dir = tmp_path / "out"
+    stem_dir = out_dir / "stem" / "auto"
+    stem_dir.mkdir(parents=True)
+    (stem_dir / "stem.md").write_text("# x", encoding="utf-8")
+    seen = {}
+
+    async def fake_convert(file_id, src_path, out_dir, upper=85):
+        return {"files": []}
+
+    async def fake_refine(file_id, md_path, **kwargs):
+        seen.update(kwargs)
+
+    with patch("app.main._convert_with_progress", new=fake_convert):
+        with patch("app.main._refine_md", new=fake_refine):
+            with patch("app.main.trim_output"), patch("app.main.trim_uploads"):
+                asyncio.run(main._run_convert("t_alt", "x.pdf", str(out_dir), optimize=False, alt=True))
+
+    assert seen == {"add_alt": True, "do_refine": False}
+
+
+def test_run_convert_runs_refine_when_optimize(tmp_path):
+    import asyncio
+    from app import main
+    out_dir = tmp_path / "out"
+    stem_dir = out_dir / "stem" / "auto"
+    stem_dir.mkdir(parents=True)
+    (stem_dir / "stem.md").write_text("# x", encoding="utf-8")
+    called = {"refine": False}
+
+    async def fake_convert(file_id, src_path, out_dir, upper=85):
+        return {"files": []}
+
+    async def fake_refine(file_id, md_path, **kwargs):
+        called["refine"] = True
+
+    with patch("app.main._convert_with_progress", new=fake_convert):
+        with patch("app.main._refine_md", new=fake_refine):
+            with patch("app.main.trim_output"), patch("app.main.trim_uploads"):
+                asyncio.run(main._run_convert("t_opt", "x.pdf", str(out_dir), optimize=True))
+
+    assert called["refine"] is True
+
+
+def test_refine_md_caps_image_concurrency_and_dedupes(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+    import time
+    from app import main, config
+
+    monkeypatch.setattr(config, "VLM_MAX_CONCURRENCY", 3)
+
+    # 10 处引用、9 张唯一图片，其中 img0.jpg 重复一次
+    lines = []
+    for i in range(9):
+        (tmp_path / f"img{i}.jpg").write_bytes(b"x")
+        lines.append(f"![](img{i}.jpg)")
+    lines.append("![](img0.jpg)")
+    md = tmp_path / "doc.md"
+    md.write_text("\n".join(lines), encoding="utf-8")
+
+    state = {"active": 0, "peak": 0, "calls": 0}
+    guard = threading.Lock()
+
+    def fake_describe(path):
+        with guard:
+            state["active"] += 1
+            state["calls"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        time.sleep(0.02)
+        with guard:
+            state["active"] -= 1
+        return "图片描述"
+
+    with patch("app.refiner.describe_image", side_effect=fake_describe), \
+         patch("app.refiner.refine", side_effect=lambda t: t):
+        asyncio.run(main._refine_md("t_conc", str(md)))
+
+    assert state["calls"] == 9          # 去重后只识别 9 张唯一图片
+    assert 2 <= state["peak"] <= 3      # 有并发且不超过上限
+    out = (tmp_path / "doc_optimized.md").read_text(encoding="utf-8")
+    assert out.count("![图片描述](img0.jpg)") == 2  # 重复引用全部替换
+    assert "![](" not in out
+
+
+def test_refine_md_alt_only_persists_without_refine(tmp_path):
+    import asyncio
+    from app import main
+
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    md = tmp_path / "doc.md"
+    md.write_text("![](a.jpg)\n正文", encoding="utf-8")
+
+    def fake_describe(path):
+        return "一张图"
+
+    with patch("app.refiner.describe_image", side_effect=fake_describe), \
+         patch("app.refiner.refine", side_effect=AssertionError("不应调用 refine")):
+        asyncio.run(main._refine_md("t_alt_only", str(md), add_alt=True, do_refine=False))
+
+    out = (tmp_path / "doc_optimized.md").read_text(encoding="utf-8")
+    assert out == "![一张图](a.jpg)\n正文"
+
+
+def test_refine_md_skips_alt_when_disabled(tmp_path):
+    import asyncio
+    from app import main
+
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    md = tmp_path / "doc.md"
+    md.write_text("![](a.jpg)", encoding="utf-8")
+
+    with patch("app.refiner.describe_image", side_effect=AssertionError("不应识图")), \
+         patch("app.refiner.refine", return_value=None):
+        asyncio.run(main._refine_md("t_no_alt", str(md), add_alt=False, do_refine=True))
+
+    assert not (tmp_path / "doc_optimized.md").exists()
+

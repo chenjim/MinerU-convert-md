@@ -6,7 +6,7 @@ from pathlib import Path
 from openai import OpenAI
 from app import config
 
-DESCRIBE_PROMPT = "请简要描述这张图片的内容，包括图中的文字。50字以内，只返回描述，不要额外说明。"
+DESCRIBE_PROMPT = "请简要描述这张图片的内容，包括图中的文字。200字以内，只返回描述，不要额外说明。"
 
 REFINE_PROMPT = """你是一名文档排版专家。请对以下由 OCR/文档转换生成的 Markdown 文本进行全面优化：
 
@@ -34,15 +34,29 @@ REFINE_PROMPT = """你是一名文档排版专家。请对以下由 OCR/文档�
 - 只输出修正后的 Markdown，不要额外说明"""
 
 
+# 识图描述的输出 token 上限。目标模型是推理模型，reasoning 计入 max_tokens，
+# 上限给小会只产出 reasoning、content 为空（表现为 "empty response"）。
+DESCRIBE_MAX_TOKENS = 10240
+
+
 def get_client() -> OpenAI | None:
+    """文本 LLM 客户端，用于整篇 Markdown 排版优化。"""
     if not config.LLM_API_KEY:
         return None
-    return OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
+    # max_retries=0：重试交给外层控制，避免 SDK 内部重试把单次超时放大数倍
+    return OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL, max_retries=0)
+
+
+def get_image_client() -> OpenAI | None:
+    """视觉模型客户端，用于图片 alt 描述（可与文本 LLM 分离，如本地 ollama）。"""
+    if not config.VLM_API_KEY:
+        return None
+    return OpenAI(api_key=config.VLM_API_KEY, base_url=config.VLM_BASE_URL, max_retries=0)
 
 
 def describe_image(image_path: str, retries: int = 3, timeout: float = 60) -> str | None:
     """生成图片 alt 描述。视觉接口偶发失败，自动重试 retries 次。"""
-    client = get_client()
+    client = get_image_client()
     if client is None:
         return None
 
@@ -58,7 +72,7 @@ def describe_image(image_path: str, retries: int = 3, timeout: float = 60) -> st
     for attempt in range(1, retries + 1):
         try:
             resp = client.chat.completions.create(
-                model=config.LLM_MODEL,
+                model=config.VLM_MODEL,
                 messages=[{
                     "role": "user",
                     "content": [
@@ -67,7 +81,7 @@ def describe_image(image_path: str, retries: int = 3, timeout: float = 60) -> st
                     ],
                 }],
                 temperature=0.1,
-                max_tokens=256,
+                max_tokens=DESCRIBE_MAX_TOKENS,
                 timeout=timeout,
             )
             content = resp.choices[0].message.content

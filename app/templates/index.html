@@ -29,13 +29,23 @@
     .formats { color: #999; font-size: 13px; margin-top: 8px; }
     #fileInput { display: none; }
     .btn {
-      display: inline-block; margin-top: 16px;
+      display: inline-block;
       background: #4A90D9; color: #fff; border: none;
       padding: 10px 28px; border-radius: 6px; cursor: pointer;
       font-size: 15px;
     }
     .btn:hover { background: #357ABD; }
     .btn:disabled { background: #aaa; cursor: not-allowed; }
+
+    .actions {
+      display: flex; align-items: center; justify-content: center;
+      gap: 16px; margin-top: 16px; flex-wrap: wrap;
+    }
+    .opt-toggle {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 14px; color: #555; cursor: pointer; user-select: none;
+    }
+    .opt-toggle input { width: 16px; height: 16px; cursor: pointer; }
 
     .progress-wrap {
       margin-top: 20px; border-top: 1px solid #eee; padding-top: 16px;
@@ -72,7 +82,15 @@
       </div>
       <input type="file" id="fileInput" accept=".pdf,.docx,.pptx,.xlsx,.png,.jpg,.jpeg">
 
-      <div style="text-align:center">
+      <div class="actions">
+        <label class="opt-toggle">
+          <input type="checkbox" id="altToggle">
+          <span>补充图片描述（alt）</span>
+        </label>
+        <label class="opt-toggle">
+          <input type="checkbox" id="optimizeToggle">
+          <span>大模型优化排版（耗时增加）</span>
+        </label>
         <button class="btn" id="convertBtn" disabled>转换</button>
       </div>
 
@@ -92,6 +110,8 @@
     const dropZone = document.getElementById('dropZone');
     const fileInput = document.getElementById('fileInput');
     const convertBtn = document.getElementById('convertBtn');
+    const optimizeToggle = document.getElementById('optimizeToggle');
+    const altToggle = document.getElementById('altToggle');
     const progressWrap = document.getElementById('progressWrap');
     const progressFill = document.getElementById('progressFill');
     const progressLabel = document.getElementById('progressLabel');
@@ -147,8 +167,10 @@
         }
         const fileId = upData.file_id;
 
-        setProgress(10, '排队中...');
-        const cvRes = await fetch(`/convert/${fileId}`, { method: 'POST' });
+        setProgress(5, '排队中...');
+        const optimize = optimizeToggle.checked ? 'true' : 'false';
+        const alt = altToggle.checked ? 'true' : 'false';
+        const cvRes = await fetch(`/convert/${fileId}?optimize=${optimize}&alt=${alt}`, { method: 'POST' });
         if (!cvRes.ok) {
           const err = await cvRes.json().catch(() => ({}));
           throw new Error(err.detail || '转换启动失败');

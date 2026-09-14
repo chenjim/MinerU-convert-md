@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("LLM_API_KEY", "")
 os.environ.setdefault("OUTPUT_MAX_SIZE", str(500 * 1024 * 1024))
+os.environ.setdefault("MINERU_WARM_POOL", "0")
 
 from app.main import app
 
@@ -19,6 +20,9 @@ def mock_subprocess():
     mock_process = MagicMock()
     mock_process.returncode = 0
     mock_process.communicate = AsyncMock(return_value=(b"", b""))
+    mock_process.wait = AsyncMock(return_value=0)
+    mock_process.stderr = MagicMock()
+    mock_process.stderr.read = AsyncMock(return_value=b"")
 
     with patch("app.main.asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock:
         mock.return_value = mock_process
