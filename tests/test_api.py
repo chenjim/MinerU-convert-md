@@ -287,3 +287,53 @@ def test_refine_md_skips_alt_when_disabled(tmp_path):
 
     assert not (tmp_path / "doc_optimized.md").exists()
 
+
+
+def test_download_blocks_path_traversal(client, tmp_path):
+    from app import config
+    file_id = "trav_test"
+    content_dir = tmp_path / "output" / file_id / "stem" / "auto"
+    content_dir.mkdir(parents=True)
+    (content_dir / "stem.md").write_text("# ok", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("top-secret", encoding="utf-8")
+
+    with patch("app.config.OUTPUT_DIR", tmp_path / "output"):
+        assert client.get(f"/download/{file_id}?filename=stem/auto/stem.md").status_code == 200
+        for bad in ("../../secret.txt", "../../../etc/passwd", "/etc/passwd"):
+            r = client.get(f"/download/{file_id}", params={"filename": bad})
+            assert r.status_code == 404, bad
+            assert "top-secret" not in r.text
+
+
+def test_convert_rejects_when_pending_full(client, tmp_path):
+    from app import config, main
+    fid = "cap_test"
+    up = tmp_path / "uploads" / fid
+    up.mkdir(parents=True)
+    (up / "a.pdf").write_bytes(b"x")
+
+    with patch("app.config.UPLOAD_DIR", tmp_path / "uploads"), \
+         patch("app.config.OUTPUT_DIR", tmp_path / "output"), \
+         patch("app.config.MAX_PENDING_TASKS", 5), \
+         patch.object(main, "_pending", {f"p{i}": object() for i in range(5)}):
+        resp = client.post(f"/convert/{fid}")
+        assert resp.status_code == 429
+
+
+def test_trim_output_keeps_active_tasks(tmp_path):
+    from app import config, main
+    out = tmp_path / "output"
+    active, old = out / "active_id", out / "old_id"
+    for d in (active, old):
+        (d / "stem").mkdir(parents=True)
+        (d / "stem" / "big.md").write_bytes(b"x" * 1000)
+
+    main._task_status["active_id"] = {"status": "converting", "phase": "", "pct": 50}
+    try:
+        with patch("app.config.OUTPUT_DIR", out), patch("app.config.OUTPUT_MAX_SIZE", 500):
+            main.trim_output()
+    finally:
+        main._task_status.pop("active_id", None)
+
+    assert active.exists()      # 转换中，保留
+    assert not old.exists()     # 超限，逐出

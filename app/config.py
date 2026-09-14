@@ -10,6 +10,8 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FILE_SIZE = 100 * 1024 * 1024
 OUTPUT_MAX_SIZE = int(os.getenv("OUTPUT_MAX_SIZE", str(500 * 1024 * 1024)))
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".png", ".jpg", ".jpeg"}
+# 同时存在于队列/执行中的转换任务上限，超出返回 429
+MAX_PENDING_TASKS = int(os.getenv("MAX_PENDING_TASKS", "5"))
 MINERU_BACKEND = os.getenv("MINERU_BACKEND", "pipeline")
 MINERU_METHOD = os.getenv("MINERU_METHOD", "auto")
 

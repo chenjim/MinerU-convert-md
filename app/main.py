@@ -304,7 +304,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _active_ids() -> set[str]:
+    """仍在排队/转换中的任务 id，清理时必须保留。"""
+    return {
+        fid
+        for fid, st in _task_status.items()
+        if st.get("status") in ("pending", "converting")
+    } | set(_pending)
+
+
 def trim_output():
+    active = _active_ids()
     dirs = []
     total = 0
     for d in config.OUTPUT_DIR.iterdir():
@@ -315,14 +325,18 @@ def trim_output():
         total += size
     if total <= config.OUTPUT_MAX_SIZE:
         return
+    # 按最旧优先逐出，跳过仍在转换的任务，避免删掉在用结果
     for _, d, sz in sorted(dirs):
+        if d.name in active:
+            continue
         shutil.rmtree(d, ignore_errors=True)
         total -= sz
         if total <= config.OUTPUT_MAX_SIZE:
             break
 
 def trim_uploads():
-    ids_in_use = {d.name for d in config.OUTPUT_DIR.iterdir() if d.is_dir()}
+    # 保留有输出目录的、以及仍在转换/排队中的上传
+    ids_in_use = {d.name for d in config.OUTPUT_DIR.iterdir() if d.is_dir()} | _active_ids()
     for d in sorted(config.UPLOAD_DIR.iterdir(), key=lambda d: d.stat().st_mtime):
         if d.is_dir() and d.name not in ids_in_use:
             shutil.rmtree(d, ignore_errors=True)
@@ -379,6 +393,9 @@ async def convert(file_id: str, optimize: bool = Query(False), alt: bool = Query
 
     if _task_status.get(file_id, {}).get("status") in ("pending", "converting"):
         raise HTTPException(status_code=409, detail="转换正在进行中")
+
+    if len(_pending) >= config.MAX_PENDING_TASKS:
+        raise HTTPException(status_code=429, detail=f"任务过多（上限 {config.MAX_PENDING_TASKS}），请稍后再试")
 
     files = list(save_dir.iterdir())
     if not files:
@@ -449,11 +466,12 @@ async def download(file_id: str, filename: str = "", zip: bool = Query(False)):
         )
 
     if filename:
-        file_path = file_dir / filename
-        if not file_path.exists():
+        # 限制在本次任务目录内，防止 ../../ 路径穿越读取任意文件
+        base = file_dir.resolve()
+        file_path = (base / filename).resolve()
+        if not file_path.is_relative_to(base) or not file_path.is_file():
             raise HTTPException(status_code=404, detail="文件不存在")
-        name = Path(filename).name
-        return FileResponse(str(file_path), filename=name)
+        return FileResponse(str(file_path), filename=file_path.name)
 
     md_files = sorted(file_dir.rglob("*.md"))
     if md_files:

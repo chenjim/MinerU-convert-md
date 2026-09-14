@@ -89,6 +89,12 @@ FastAPI (app/main.py)
 - 单页应用，拖拽/选择文件 → 上传 → 转换 → 轮询进度 → 下载 zip。
 - 深色模式：默认跟随系统（`prefers-color-scheme`），右上角按钮可手动切换，选择存入 `localStorage`；首屏用内联脚本预设主题，避免闪白。
 
+### 5.8 安全
+- **路径穿越防护**：`/download` 的 `filename` 解析后必须仍位于任务目录内，且必须是文件，否则 404。
+- **任务上限**：同时排队/转换中的任务数不超过 `MAX_PENDING_TASKS`（默认 5），超出返回 429。
+- **清理保护**：`trim_output`/`trim_uploads` 跳过仍在转换/排队中的任务目录。
+- 部署建议：外网只经反向代理（HTTPS + 代理层鉴权/限流）。应用内暂未做鉴权，公网暴露前需在代理层加认证（如 NPM Access List / Basic Auth）。
+
 ## 6. 接口契约
 
 | 方法 | 路径 | 参数 | 返回 |
@@ -120,6 +126,7 @@ FastAPI (app/main.py)
 | `VLM_MODEL` | 回退 `LLM_MODEL` | 视觉模型 |
 | `VLM_MAX_CONCURRENCY` | `5` | 识图并发数 |
 | `OUTPUT_MAX_SIZE` | 500MB | 输出目录上限 |
+| `MAX_PENDING_TASKS` | `5` | 同时排队/转换中的任务上限 |
 
 > 文本 LLM 与视觉模型分离：识图可指向本地 ollama（如 `VLM_BASE_URL=http://192.168.31.165:11434/v1`、`VLM_MODEL=qwen3.5:2b`），排版优化仍用远端。
 
@@ -157,5 +164,6 @@ docker exec mineru-convert-md python3 -m pytest tests/ -v
 - 文本 LLM 与视觉模型拆分为两套配置（`LLM_*` / `VLM_*`）；识图切本地 ollama `qwen3.5:2b`。
 - 新增前端「补充图片描述（alt）」开关（默认关），与「大模型优化排版」解耦；`/convert` 增加 `alt` 参数。
 - 前端新增深色模式：跟随系统 + 手动切换，`localStorage` 记忆。
+- 安全加固：修复 `/download` 的 `filename` 路径穿越；`MAX_PENDING_TASKS=5` 队列上限（超出 429）；`trim_output`/`trim_uploads` 跳过在用任务。（应用内 Bearer 鉴权曾实现，后按需求移除；鉴权改由反向代理层承担。）
 - 识图输出上限 200 字，`max_tokens` 10240，单请求超时 60s，关闭 SDK 内部重试。
 - PDF `auto` 方法透传 MinerU 分类器（移除应用内 pypdf 启发式）。
